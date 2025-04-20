@@ -1,0 +1,6 @@
+ccxt
+python-telegram-bot==20.0
+pandas
+numpy
+python-dotenv
+requests
