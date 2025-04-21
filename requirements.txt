@@ -1,8 +1,9 @@
 ccxt
-python-telegram-bot==20.8  # Aniq versiyani belgilaymiz
+python-telegram-bot==20.8
 pandas
 numpy==1.24.3
 python-dotenv
 requests
 schedule
 pandas_ta
+flask
