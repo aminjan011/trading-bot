@@ -1,390 +1,192 @@
 import ccxt
+import pandas as pd
+import pandas_ta as ta
 import time
-import logging
+import schedule
+from telegram import Bot
+from telegram.ext import CommandHandler, Updater
 from dotenv import load_dotenv
 import os
-import pandas as pd
-import numpy as np
-from telegram import Bot
-import schedule
-import threading
-import asyncio
+import logging
 
-# Logging sozlash
-logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging sozlamalari
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# .env faylidan kalitlarni o'qish
+# .env faylidan o'qish
 load_dotenv()
-api_key = os.getenv('API_KEY')
-api_secret = os.getenv('API_SECRET')
-password = os.getenv('PASSWORD')
-telegram_token = os.getenv('TELEGRAM_TOKEN')
-chat_id = os.getenv('CHAT_ID')
-channel_id = os.getenv('CHANNEL_ID')
+API_KEY = os.getenv('API_KEY')
+API_SECRET = os.getenv('API_SECRET')
+CHAT_ID = os.getenv('CHAT_ID')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+PASSWORD = os.getenv('PASSWORD')
 
-# Bitget API ulanishi
+# Bitget birjasi sozlamalari
 exchange = ccxt.bitget({
-    'apiKey': api_key,
-    'secret': api_secret,
-    'password': password,
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
     'enableRateLimit': True,
 })
-exchange.options['defaultType'] = 'swap'
+exchange.set_sandbox_mode(False)  # Real hisob uchun False
 
-# Telegram xabar yuborish
-async def send_telegram_message(message):
-    try:
-        bot = Bot(token=telegram_token)
-        await bot.send_message(chat_id=chat_id, text=message)
-        await bot.send_message(chat_id=channel_id, text=message)
-        logging.info(f"Telegram xabari yuborildi: {message}")
-    except Exception as e:
-        print(f"Telegram xabar yuborishda xato: {str(e)}")
-        logging.error(f"Telegram xabar xatosi: {str(e)}")
+# Telegram bot sozlamalari
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
+updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+dispatcher = updater.dispatcher
 
-def sync_send_telegram_message(message):
-    asyncio.run(send_telegram_message(message))
+# Indikator sozlamalari
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
+MACD_FAST = 8
+MACD_SLOW = 21
+MACD_SIGNAL = 5
+ADX_THRESHOLD = 20
+EMA_PERIOD = 10
 
-# RSI hisoblash
-def calculate_rsi(data, periods=14):
-    delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+# Komissiyalar
+MAKER_FEE = 0.0002  # 0.02%
+TAKER_FEE = 0.0006  # 0.06%
+FUNDING_RATE = 0.0002  # Taxminiy 0.02% (24 soat uchun 3 marta)
+TOTAL_FEES = MAKER_FEE + TAKER_FEE + FUNDING_RATE  # 0.14%
 
-# MACD hisoblash
-def calculate_macd(data, fast=8, slow=21, signal=5):
-    exp1 = data.ewm(span=fast, adjust=False).mean()
-    exp2 = data.ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    return macd, signal_line
+# TP va SL sozlamalari (komissiyalarni hisobga olgan holda)
+STOP_LOSS_PERCENT = 0.006  # 0.6%
+TAKE_PROFIT_PERCENT = 0.017  # 1.7%
+EFFECTIVE_TP = TAKE_PROFIT_PERCENT - TOTAL_FEES
+EFFECTIVE_SL = STOP_LOSS_PERCENT + TOTAL_FEES
+RISK_PER_TRADE = 0.01  # Balansning 1% riski
 
-# ADX hisoblash
-def calculate_adx(df, period=14):
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
-    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
-    adx = dx.ewm(span=period, adjust=False).mean()
-    return adx
+# Global o'zgaruvchilar
+SYMBOL = 'XRP/USDT:USDT'
+TIMEFRAME = '1h'
+DAILY_PROFIT_TARGET = 0.01  # 1%
+initial_balance = 0
+current_balance = 0
+daily_profit = 0
 
-# Bollinger Bands hisoblash
-def calculate_bollinger_bands(df, period=20, std=2):
-    sma = df['close'].rolling(window=period).mean()
-    std_dev = df['close'].rolling(window=period).std()
-    upper = sma + std_dev * std
-    lower = sma - std_dev * std
-    return upper, lower
+# Ma'lumotlarni olish
+def fetch_data():
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-# ATR hisoblash
-def calculate_atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+# Indikatorlarni hisoblash
+def calculate_indicators(df):
+    df['ema10'] = ta.ema(df['close'], length=EMA_PERIOD)
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    macd = ta.macd(df['close'], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    df['macd'] = macd['MACD_8_21_5']
+    df['macd_signal'] = macd['MACDs_8_21_5']
+    df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
+    return df
 
-# Volume Oscillator hisoblash
-def calculate_volume_oscillator(df, short_period=5, long_period=20):
-    short_vol = df['volume'].rolling(window=short_period).mean()
-    long_vol = df['volume'].rolling(window=long_period).mean()
-    return (short_vol - long_vol) / long_vol * 100
+# Signal hosil qilish
+def generate_signal(data):
+    rsi = data['rsi'].iloc[-1]
+    macd = data['macd'].iloc[-1]
+    macd_signal = data['macd_signal'].iloc[-1]
+    adx = data['adx'].iloc[-1]
+    ema10 = data['ema10'].iloc[-1]
+    close = data['close'].iloc[-1]
 
-# EMA hisoblash
-def calculate_ema(data, period=50):
-    return data.ewm(span=period, adjust=False).mean()
+    buy_signal = (rsi < RSI_OVERSOLD) and (macd > macd_signal) and (adx > ADX_THRESHOLD) and (close > ema10)
+    sell_signal = (rsi > RSI_OVERBOUGHT) and (macd < macd_signal) and (adx > ADX_THRESHOLD) and (close < ema10)
 
-# Leverage va margin rejimini tasdiqlash
-def verify_leverage_and_margin(symbol):
-    try:
-        print(f"Diqqat: {symbol} uchun Leverage (20x), margin rejimi (cross) va pozitsiya rejimi (one-way) Bitget platformasida qo'lda o'rnatilgan bo'lishi kerak.")
-        logging.info(f"{symbol} uchun leverage va margin rejimi qo'lda o'rnatilgan deb hisoblandi.")
-        return True
-    except Exception as e:
-        print(f"{symbol} leverage/margin tekshirishda xato: {str(e)}")
-        logging.error(f"{symbol} leverage/margin xatosi: {str(e)}")
-        return False
-
-# Ochiq pozitsiyalarni tekshirish
-def check_open_positions(symbol):
-    try:
-        positions = exchange.fetch_positions([symbol])
-        for position in positions:
-            if position['contracts'] > 0:
-                return True
-        return False
-    except Exception as e:
-        print(f"{symbol} pozitsiyalarni tekshirishda xato: {str(e)}")
-        logging.error(f"{symbol} pozitsiya xatosi: {str(e)}")
-        return True
-
-# Signalni tekshirish
-def check_signal(symbol, timeframe='3m'):
-    limit = 100
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['rsi'] = calculate_rsi(df['close'], periods=14)
-            df['macd'], df['macd_signal'] = calculate_macd(df['close'], fast=8, slow=21, signal=5)
-            df['adx'] = calculate_adx(df, period=14)
-            df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df, period=20, std=2)
-            df['atr'] = calculate_atr(df, period=14)
-            df['volume_osc'] = calculate_volume_oscillator(df, short_period=5, long_period=20)
-            df['ema50'] = calculate_ema(df['close'], period=50)
-            latest = df.iloc[-1]
-            prev = df.iloc[-2]
-            prev2 = df.iloc[-3]
-            atr_threshold = 0.002 * latest['close']  # 0.2% narx o'zgarishi
-            bb_confirm = prev['close'] < prev['bb_lower'] and prev2['close'] < prev2['bb_lower']
-            if (latest['rsi'] < 70 and
-                latest['macd'] > latest['macd_signal'] and prev['macd'] <= prev['macd_signal'] and
-                latest['adx'] > 30 and
-                latest['close'] < latest['bb_lower'] and bb_confirm and
-                latest['atr'] > atr_threshold and
-                latest['volume_osc'] > 20 and
-                latest['close'] > latest['ema50']):
-                return "buy"
-            return "hold"
-        except Exception as e:
-            print(f"{symbol} signal tekshirishda xato (urinish {attempt+1}/{max_retries}): {str(e)}")
-            logging.error(f"{symbol} signal xatosi: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-            else:
-                return "hold"
+    return buy_signal, sell_signal
 
 # Balansni olish
 def get_balance():
-    try:
-        balance = exchange.fetch_balance()
-        return balance['total']['USDT']
-    except Exception as e:
-        print(f"Balans olishda xato: {str(e)}")
-        logging.error(f"Balans xatosi: {str(e)}")
-        return 15  # Default
+    balance = exchange.fetch_balance()
+    usdt_balance = balance['total'].get('USDT', 0)
+    return usdt_balance
 
-# Bitim hajmini hisoblash
-def calculate_trade_amount(symbol, risk_percent=0.05, stop_loss_percent=0.01):
-    try:
-        balance = get_balance()
-        risk_amount = balance * risk_percent  # 5% risk
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
-        trade_value = risk_amount / stop_loss_percent
-        amount = trade_value / current_price
-        min_amount = 10  # Bitget minimal hajmi
-        amount = max(amount, min_amount)
-        amount = round(amount, 2)
-        return amount
-    except Exception as e:
-        print(f"Bitim hajmi hisoblashda xato: {str(e)}")
-        logging.error(f"Bitim hajmi xatosi: {str(e)}")
-        return 50  # Default
+# Position hajmini hisoblash
+def calculate_position_size(balance, price):
+    max_loss = balance * RISK_PER_TRADE
+    price_diff = price * STOP_LOSS_PERCENT
+    position_size = max_loss / price_diff
+    return position_size
 
-# Kunlik savdo natijalarini hisoblash
-trade_stats = {'trades': 0, 'profit': 0, 'initial_balance': 15}
-def track_daily_results(order_type, profit=0):
-    global trade_stats
-    if order_type == 'open':
-        trade_stats['trades'] += 1
-    elif order_type == 'close':
-        trade_stats['profit'] += profit
-    return trade_stats
-
-# Kunlik hisobot yuborish
-def send_daily_report():
-    global trade_stats
+# Savdo ochish
+def open_trade(side, price, balance):
     try:
-        current_balance = exchange.fetch_balance()['total']['USDT']
-        profit_percent = ((current_balance - trade_stats['initial_balance']) / trade_stats['initial_balance']) * 100
-        message = (
-            f"📊 Kunlik savdo natijalari ({time.strftime('%Y-%m-%d')}):\n"
-            f"🔄 Savdolar soni: {trade_stats['trades']}\n"
-            f"💰 Jami foyda/yo‘qotish: {profit_percent:.2f}%\n"
-            f"📈 Joriy balans: {current_balance:.2f} USDT"
+        amount = calculate_position_size(balance, price)
+        sl_price = price * (1 - STOP_LOSS_PERCENT) if side == "buy" else price * (1 + STOP_LOSS_PERCENT)
+        tp_price = price * (1 + TAKE_PROFIT_PERCENT) if side == "buy" else price * (1 - TAKE_PROFIT_PERCENT)
+
+        order = exchange.create_order(
+            SYMBOL, 'limit', side, amount, price,
+            params={'stopLossPrice': sl_price, 'takeProfitPrice': tp_price}
         )
-        sync_send_telegram_message(message)
-        trade_stats['trades'] = 0
-        trade_stats['profit'] = 0
-        trade_stats['initial_balance'] = current_balance
-        logging.info("Kunlik hisobot yuborildi.")
+        logging.info(f"{side.capitalize()} order placed: {order}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
     except Exception as e:
-        print(f"Kunlik hisobot yuborishda xato: {str(e)}")
-        logging.error(f"Kunlik hisobot xatosi: {str(e)}")
+        logging.error(f"Error placing {side} order: {e}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
 
-# Buyurtmalarni kuzatish
-def monitor_orders(symbol, order_id, entry_price, amount, take_profit_price, stop_loss_price):
-    max_retries = 3
-    trailing_triggered = False
-    trailing_percent = 0.005  # 0.5%
-    while True:
-        try:
-            order = exchange.fetch_order(order_id, symbol)
-            if order['status'] == 'closed':
-                exit_price = order['price'] or order['average']
-                profit = (exit_price - entry_price) * amount if order['side'] == 'sell' else (entry_price - exit_price) * amount
-                message = (
-                    f"❌ {symbol} bitim yopildi (ID: {order_id}):\n"
-                    f"📈 Chiqish narxi: {exit_price:.4f} USDT\n"
-                    f"💰 Foyda/Yo‘qotish: {profit:.2f} USDT"
-                )
-                sync_send_telegram_message(message)
-                track_daily_results('close', profit)
-                break
-            orders = exchange.fetch_open_orders(symbol)
-            tp_sl_active = any(o['id'] in [str(order_id)] for o in orders)
-            if not tp_sl_active:
-                message = f"❌ {symbol} bitim qo‘lda yopildi (ID: {order_id})"
-                sync_send_telegram_message(message)
-                break
-            ticker = exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
-            if not trailing_triggered and current_price >= entry_price * 1.01:  # 1% foyda
-                trailing_triggered = True
-                logging.info(f"{symbol} trailing stop faollashtirildi.")
-            if trailing_triggered:
-                trailing_sl = current_price * (1 - trailing_percent)
-                if current_price <= trailing_sl:
-                    exit_price = current_price
-                    profit = (exit_price - entry_price) * amount
-                    exchange.create_market_sell_order(symbol, amount, params={
-                        'reduceOnly': True,
-                        'positionSide': 'long',
-                        'marginMode': 'cross'
-                    })
-                    message = (
-                        f"❌ {symbol} trailing stop yopildi:\n"
-                        f"📈 Chiqish narxi: {exit_price:.4f} USDT\n"
-                        f"💰 Foyda: {profit:.2f} USDT"
-                    )
-                    sync_send_telegram_message(message)
-                    track_daily_results('close', profit)
-                    break
-        except Exception as e:
-            print(f"{symbol} buyurtma kuzatishda xato: {str(e)}")
-            logging.error(f"{symbol} buyurtma kuzatish xatosi: {str(e)}")
-            max_retries -= 1
-            if max_retries == 0:
-                break
-            time.sleep(5)
-        time.sleep(10)
+# Botni boshqarish
+def trade():
+    global initial_balance, current_balance, daily_profit
+    try:
+        # Balansni yangilash
+        current_balance = get_balance()
+        if initial_balance == 0:
+            initial_balance = current_balance
+        daily_profit = (current_balance - initial_balance) / initial_balance
 
-# Buyurtma joylashtirish
-def place_order(symbol, signal):
-    if check_open_positions(symbol):
-        print(f"{symbol} uchun ochiq pozitsiya mavjud. Yangi bitim ochilmadi.")
-        logging.info(f"{symbol} uchun ochiq pozitsiya mavjud.")
-        return
-    take_profit_percent = 0.03  # 3%
-    stop_loss_percent = 0.01   # 1%
-    max_retries = 3
-    if signal == "buy":
-        for attempt in range(max_retries):
-            try:
-                amount = calculate_trade_amount(symbol, risk_percent=0.05, stop_loss_percent=stop_loss_percent)
-                ticker = exchange.fetch_ticker(symbol)
-                current_price = ticker['last']
-                order = exchange.create_limit_buy_order(symbol, amount, current_price, params={
-                    'positionSide': 'long',
-                    'marginMode': 'cross'
-                })
-                message = (
-                    f"✅ {symbol} bitim ochildi (ID: {order['id']}):\n"
-                    f"📈 Kirish narxi: {current_price:.4f} USDT\n"
-                    f"📊 Miqdor: {amount} {symbol.split('/')[0]}"
-                )
-                sync_send_telegram_message(message)
-                track_daily_results('open')
-                take_profit_price = current_price * (1 + take_profit_percent)
-                stop_loss_price = current_price * (1 - stop_loss_percent)
-                tp_order = exchange.create_order(
-                    symbol=symbol,
-                    type='limit',
-                    side='sell',
-                    amount=amount,
-                    price=take_profit_price,
-                    params={
-                        'takeProfitPrice': take_profit_price,
-                        'reduceOnly': True,
-                        'positionSide': 'long',
-                        'marginMode': 'cross'
-                    }
-                )
-                print(f"{symbol} Take-Profit buyurtmasi o'rnatildi (narx: {take_profit_price}): {tp_order}")
-                logging.info(f"{symbol} Take-Profit: {tp_order}")
-                sl_order = exchange.create_order(
-                    symbol=symbol,
-                    type='market',
-                    side='sell',
-                    amount=amount,
-                    params={
-                        'stopLossPrice': stop_loss_price,
-                        'reduceOnly': True,
-                        'positionSide': 'long',
-                        'marginMode': 'cross'
-                    }
-                )
-                print(f"{symbol} Stop-Loss buyurtmasi o'rnatildi (narx: {stop_loss_price}): {sl_order}")
-                logging.info(f"{symbol} Stop-Loss: {sl_order}")
-                threading.Thread(target=monitor_orders, args=(symbol, order['id'], current_price, amount, take_profit_price, stop_loss_price)).start()
-                break
-            except Exception as e:
-                print(f"{symbol} buyurtma joylashtirishda xato (urinish {attempt+1}/{max_retries}): {str(e)}")
-                logging.error(f"{symbol} buyurtma xatosi: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                else:
-                    raise
-    else:
-        print(f"{symbol} uchun buyurtma joylashtirilmadi.")
+        # Kunlik foyda maqsadiga yetildi
+        if daily_profit >= DAILY_PROFIT_TARGET:
+            logging.info(f"Daily profit target reached: {daily_profit*100}%")
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
+            return
 
-# Kunlik hisobotni rejalashtirish
-def run_scheduler():
-    schedule.every().day.at("23:59").do(send_daily_report)
+        # Ma'lumotlarni olish va indikatorlarni hisoblash
+        df = fetch_data()
+        df = calculate_indicators(df)
+        buy_signal, sell_signal = generate_signal(df)
+
+        # Narxni olish
+        ticker = exchange.fetch_ticker(SYMBOL)
+        current_price = ticker['last']
+
+        # Signal asosida savdo
+        if buy_signal:
+            logging.info(f"Buy signal generated for {SYMBOL}")
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
+            open_trade('buy', current_price, current_balance)
+        elif sell_signal:
+            logging.info(f"Sell signal generated for {SYMBOL}")
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
+            open_trade('sell', current_price, current_balance)
+
+    except Exception as e:
+        logging.error(f"Error in trade loop: {e}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
+
+# Telegram buyruqlari
+def start(update, context):
+    update.message.reply_text("Trading bot started! Use /balance to check balance.")
+    schedule.every(5).minutes.do(trade)
+
+def balance(update, context):
+    balance = get_balance()
+    update.message.reply_text(f"Current USDT balance: {balance}")
+
+# Telegram handlerlari
+start_handler = CommandHandler('start', start)
+balance_handler = CommandHandler('balance', balance)
+dispatcher.add_handler(start_handler)
+dispatcher.add_handler(balance_handler)
+
+# Botni ishga tushirish
+if __name__ == "__main__":
+    logging.info("Bot started")
+    telegram_bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
+    updater.start_polling()
     while True:
         schedule.run_pending()
-        time.sleep(60)
-
-# Main funksiyasi
-def main():
-    symbol = 'XRP/USDT:USDT'
-    if not verify_leverage_and_margin(symbol):
-        message = f"❌ {symbol} leverage/margin tasdiqlanmadi. Savdo to'xtatiladi."
-        sync_send_telegram_message(message)
-        print(message)
-        return
-    signal = check_signal(symbol, timeframe='3m')
-    print(f"{symbol} signal: {signal}")
-    place_order(symbol, signal)
-
-if __name__ == '__main__':
-    sync_send_telegram_message("🤖 90% win rate uchun optimallashtirilgan savdo boti ishga tushdi!")
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    try:
-        while True:
-            try:
-                main()
-            except Exception as e:
-                print(f"Umumiy xato: {str(e)}")
-                logging.error(f"Umumiy xato: {str(e)}")
-            time.sleep(30)
-    except KeyboardInterrupt:
-        sync_send_telegram_message("🛑 Savdo boti o'chirildi!")
-        print("Bot to'xtatildi.")
-        logging.info("Bot o'chirildi.")
+        time.sleep(1)
