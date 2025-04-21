@@ -3,7 +3,8 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import schedule
-from telegram.ext import Application, CommandHandler
+from telegram import Bot
+from telegram.ext import CommandHandler, Updater
 from dotenv import load_dotenv
 import os
 import logging
@@ -32,7 +33,9 @@ exchange = ccxt.bitget({
 exchange.set_sandbox_mode(False)  # Real hisob uchun False
 
 # Telegram bot sozlamalari
-application = Application.builder().token(TELEGRAM_TOKEN).build()
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
+updater = Updater(TELEGRAM_TOKEN, use_context=True)
+dispatcher = updater.dispatcher
 
 # Indikator sozlamalari
 RSI_OVERSOLD = 40
@@ -109,7 +112,7 @@ def calculate_position_size(balance, price):
     return position_size
 
 # Savdo ochish
-async def open_trade(side, price, balance):
+def open_trade(side, price, balance):
     try:
         amount = calculate_position_size(balance, price)
         sl_price = price * (1 - STOP_LOSS_PERCENT) if side == "buy" else price * (1 + STOP_LOSS_PERCENT)
@@ -120,13 +123,13 @@ async def open_trade(side, price, balance):
             params={'stopLossPrice': sl_price, 'takeProfitPrice': tp_price}
         )
         logging.info(f"{side.capitalize()} order placed: {order}")
-        await application.bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
     except Exception as e:
         logging.error(f"Error placing {side} order: {e}")
-        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
 
 # Botni boshqarish
-async def trade():
+def trade():
     global initial_balance, current_balance, daily_profit
     try:
         # Balansni yangilash
@@ -138,7 +141,7 @@ async def trade():
         # Kunlik foyda maqsadiga yetildi
         if daily_profit >= DAILY_PROFIT_TARGET:
             logging.info(f"Daily profit target reached: {daily_profit*100}%")
-            await application.bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
             return
 
         # Ma'lumotlarni olish va indikatorlarni hisoblash
@@ -153,35 +156,37 @@ async def trade():
         # Signal asosida savdo
         if buy_signal:
             logging.info(f"Buy signal generated for {SYMBOL}")
-            await application.bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
-            await open_trade('buy', current_price, current_balance)
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
+            open_trade('buy', current_price, current_balance)
         elif sell_signal:
             logging.info(f"Sell signal generated for {SYMBOL}")
-            await application.bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
-            await open_trade('sell', current_price, current_balance)
+            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
+            open_trade('sell', current_price, current_balance)
 
     except Exception as e:
         logging.error(f"Error in trade loop: {e}")
-        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
 
 # Telegram buyruqlari
-async def start(update, context):
-    await update.message.reply_text("Trading bot started! Use /balance to check balance.")
-    schedule.every(5).minutes.do(lambda: application.run_async(trade))
+def start(update, context):
+    update.message.reply_text("Trading bot started! Use /balance to check balance.")
+    schedule.every(5).minutes.do(trade)
 
-async def balance(update, context):
+def balance(update, context):
     balance = get_balance()
-    await update.message.reply_text(f"Current USDT balance: {balance}")
+    update.message.reply_text(f"Current USDT balance: {balance}")
 
 # Telegram handlerlari
-application.add_handler(CommandHandler('start', start))
-application.add_handler(CommandHandler('balance', balance))
+start_handler = CommandHandler('start', start)
+balance_handler = CommandHandler('balance', balance)
+dispatcher.add_handler(start_handler)
+dispatcher.add_handler(balance_handler)
 
 # Botni ishga tushirish
 if __name__ == "__main__":
     logging.info("Bot started")
-    application.bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
-    application.run_polling(allowed_updates=["message"])
+    telegram_bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
+    updater.start_polling()
     while True:
         schedule.run_pending()
         time.sleep(1)
