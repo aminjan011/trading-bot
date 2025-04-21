@@ -8,6 +8,22 @@ import asyncio
 from dotenv import load_dotenv
 import os
 import logging
+from flask import Flask
+from threading import Thread
+
+# Flask server qo'shish
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
 
 # Logging sozlamalari
 logging.basicConfig(
@@ -142,9 +158,11 @@ async def open_trade(side, price, balance):
         )
         logging.info(f"{side.capitalize()} order placed: {order}")
         await application.bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
+        logging.info(f"Telegram message sent: {side.capitalize()} order placed")
     except Exception as e:
         logging.error(f"Error placing {side} order: {e}")
         await application.bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
+        logging.error(f"Telegram message error: {e}")
 
 # Botni boshqarish
 async def trade():
@@ -162,6 +180,7 @@ async def trade():
         if daily_profit >= DAILY_PROFIT_TARGET:
             logging.info(f"Daily profit target reached: {daily_profit*100}%")
             await application.bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
+            logging.info("Telegram message sent: Daily profit target reached")
             return
 
         # Ma'lumotlarni olish va indikatorlarni hisoblash
@@ -179,15 +198,18 @@ async def trade():
         if buy_signal:
             logging.info(f"Buy signal generated for {SYMBOL}")
             await application.bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
+            logging.info("Telegram message sent: Buy signal generated")
             await open_trade('buy', current_price, current_balance)
         elif sell_signal:
             logging.info(f"Sell signal generated for {SYMBOL}")
             await application.bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
+            logging.info("Telegram message sent: Sell signal generated")
             await open_trade('sell', current_price, current_balance)
 
     except Exception as e:
         logging.error(f"Error in trade loop: {e}")
         await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
+        logging.error(f"Telegram message error: {e}")
 
 # Telegram buyruqlari
 async def start(update, context):
@@ -198,6 +220,7 @@ async def start(update, context):
     except Exception as e:
         logging.error(f"Error in start command: {e}")
         await update.message.reply_text(f"Error starting bot: {e}")
+        logging.error(f"Telegram message error: {e}")
 
 async def balance(update, context):
     try:
@@ -207,9 +230,11 @@ async def balance(update, context):
             logging.info(f"Balance command executed: {balance}")
         else:
             await update.message.reply_text("Error fetching balance. Check logs for details.")
+            logging.error("Telegram message sent: Error fetching balance")
     except Exception as e:
         logging.error(f"Error in balance command: {e}")
         await update.message.reply_text(f"Error fetching balance: {e}")
+        logging.error(f"Telegram message error: {e}")
 
 # Telegram handlerlari
 application.add_handler(CommandHandler('start', start))
@@ -222,6 +247,7 @@ async def main():
             raise Exception("Failed to connect to Bitget API")
         logging.info("Bot started")
         await application.bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
+        logging.info("Telegram message sent: Bot started")
         await application.initialize()
         await application.start()
         await application.updater.start_polling(allowed_updates=["message"])
@@ -232,6 +258,8 @@ async def main():
             await asyncio.sleep(1)
     except Exception as e:
         logging.error(f"Error in main loop: {e}")
+        logging.error(f"Telegram message error: {e}")
 
 if __name__ == "__main__":
+    keep_alive()  # Flask serverni ishga tushirish
     asyncio.run(main())
