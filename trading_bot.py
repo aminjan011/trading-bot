@@ -3,8 +3,8 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import schedule
-from telegram import Bot
-from telegram.ext import CommandHandler, Updater
+from telegram.ext import Application, CommandHandler
+import asyncio
 from dotenv import load_dotenv
 import os
 import logging
@@ -32,10 +32,18 @@ exchange = ccxt.bitget({
 })
 exchange.set_sandbox_mode(False)  # Real hisob uchun False
 
+# API aloqasini tekshirish
+def test_api_connection():
+    try:
+        balance = exchange.fetch_balance()
+        logging.info("API connection successful: Balance fetched")
+        return True
+    except Exception as e:
+        logging.error(f"API connection failed: {e}")
+        return False
+
 # Telegram bot sozlamalari
-telegram_bot = Bot(token=TELEGRAM_TOKEN)
-updater = Updater(TELEGRAM_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # Indikator sozlamalari
 RSI_OVERSOLD = 40
@@ -69,10 +77,15 @@ daily_profit = 0
 
 # Ma'lumotlarni olish
 def fetch_data():
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        logging.info("Market data fetched successfully")
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching market data: {e}")
+        return None
 
 # Indikatorlarni hisoblash
 def calculate_indicators(df):
@@ -100,9 +113,14 @@ def generate_signal(data):
 
 # Balansni olish
 def get_balance():
-    balance = exchange.fetch_balance()
-    usdt_balance = balance['total'].get('USDT', 0)
-    return usdt_balance
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['total'].get('USDT', 0)
+        logging.info(f"USDT balance fetched: {usdt_balance}")
+        return usdt_balance
+    except Exception as e:
+        logging.error(f"Error fetching balance: {e}")
+        return None
 
 # Position hajmini hisoblash
 def calculate_position_size(balance, price):
@@ -112,7 +130,7 @@ def calculate_position_size(balance, price):
     return position_size
 
 # Savdo ochish
-def open_trade(side, price, balance):
+async def open_trade(side, price, balance):
     try:
         amount = calculate_position_size(balance, price)
         sl_price = price * (1 - STOP_LOSS_PERCENT) if side == "buy" else price * (1 + STOP_LOSS_PERCENT)
@@ -123,17 +141,19 @@ def open_trade(side, price, balance):
             params={'stopLossPrice': sl_price, 'takeProfitPrice': tp_price}
         )
         logging.info(f"{side.capitalize()} order placed: {order}")
-        telegram_bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
+        await application.bot.send_message(chat_id=CHAT_ID, text=f"{side.capitalize()} order placed at {price} with SL: {sl_price}, TP: {tp_price}")
     except Exception as e:
         logging.error(f"Error placing {side} order: {e}")
-        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
+        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
 
 # Botni boshqarish
-def trade():
+async def trade():
     global initial_balance, current_balance, daily_profit
     try:
         # Balansni yangilash
         current_balance = get_balance()
+        if current_balance is None:
+            return
         if initial_balance == 0:
             initial_balance = current_balance
         daily_profit = (current_balance - initial_balance) / initial_balance
@@ -141,11 +161,13 @@ def trade():
         # Kunlik foyda maqsadiga yetildi
         if daily_profit >= DAILY_PROFIT_TARGET:
             logging.info(f"Daily profit target reached: {daily_profit*100}%")
-            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Daily profit target reached: {daily_profit*100}%")
             return
 
         # Ma'lumotlarni olish va indikatorlarni hisoblash
         df = fetch_data()
+        if df is None:
+            return
         df = calculate_indicators(df)
         buy_signal, sell_signal = generate_signal(df)
 
@@ -156,37 +178,60 @@ def trade():
         # Signal asosida savdo
         if buy_signal:
             logging.info(f"Buy signal generated for {SYMBOL}")
-            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
-            open_trade('buy', current_price, current_balance)
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Buy signal generated for {SYMBOL}")
+            await open_trade('buy', current_price, current_balance)
         elif sell_signal:
             logging.info(f"Sell signal generated for {SYMBOL}")
-            telegram_bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
-            open_trade('sell', current_price, current_balance)
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Sell signal generated for {SYMBOL}")
+            await open_trade('sell', current_price, current_balance)
 
     except Exception as e:
         logging.error(f"Error in trade loop: {e}")
-        telegram_bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
+        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
 
 # Telegram buyruqlari
-def start(update, context):
-    update.message.reply_text("Trading bot started! Use /balance to check balance.")
-    schedule.every(5).minutes.do(trade)
+async def start(update, context):
+    try:
+        await update.message.reply_text("Trading bot started! Use /balance to check balance.")
+        schedule.every(5).minutes.do(lambda: asyncio.create_task(trade()))
+        logging.info("Bot started via /start command")
+    except Exception as e:
+        logging.error(f"Error in start command: {e}")
+        await update.message.reply_text(f"Error starting bot: {e}")
 
-def balance(update, context):
-    balance = get_balance()
-    update.message.reply_text(f"Current USDT balance: {balance}")
+async def balance(update, context):
+    try:
+        balance = get_balance()
+        if balance is not None:
+            await update.message.reply_text(f"Current USDT balance: {balance}")
+            logging.info(f"Balance command executed: {balance}")
+        else:
+            await update.message.reply_text("Error fetching balance. Check logs for details.")
+    except Exception as e:
+        logging.error(f"Error in balance command: {e}")
+        await update.message.reply_text(f"Error fetching balance: {e}")
 
 # Telegram handlerlari
-start_handler = CommandHandler('start', start)
-balance_handler = CommandHandler('balance', balance)
-dispatcher.add_handler(start_handler)
-dispatcher.add_handler(balance_handler)
+application.add_handler(CommandHandler('start', start))
+application.add_handler(CommandHandler('balance', balance))
 
 # Botni ishga tushirish
+async def main():
+    try:
+        if not test_api_connection():
+            raise Exception("Failed to connect to Bitget API")
+        logging.info("Bot started")
+        await application.bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(allowed_updates=["message"])
+
+        # Schedule tasklarini boshqarish uchun loop
+        while True:
+            schedule.run_pending()
+            await asyncio.sleep(1)
+    except Exception as e:
+        logging.error(f"Error in main loop: {e}")
+
 if __name__ == "__main__":
-    logging.info("Bot started")
-    telegram_bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
-    updater.start_polling()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    asyncio.run(main())
