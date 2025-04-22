@@ -16,6 +16,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
+    logging.info("Flask server pinged: Bot is alive")
     return "Bot is alive!"
 
 def run_flask():
@@ -161,8 +162,11 @@ async def open_trade(side, price, balance):
         logging.info(f"Telegram message sent: {side.capitalize()} order placed")
     except Exception as e:
         logging.error(f"Error placing {side} order: {e}")
-        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
-        logging.error(f"Telegram message error: {e}")
+        try:
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Error placing {side} order: {e}")
+            logging.info("Telegram message sent: Error placing order")
+        except Exception as telegram_error:
+            logging.error(f"Telegram message error: {telegram_error}")
 
 # Botni boshqarish
 async def trade():
@@ -208,8 +212,11 @@ async def trade():
 
     except Exception as e:
         logging.error(f"Error in trade loop: {e}")
-        await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
-        logging.error(f"Telegram message error: {e}")
+        try:
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in trade loop: {e}")
+            logging.info("Telegram message sent: Error in trade loop")
+        except Exception as telegram_error:
+            logging.error(f"Telegram message error: {telegram_error}")
 
 # Telegram buyruqlari
 async def start(update, context):
@@ -219,8 +226,11 @@ async def start(update, context):
         logging.info("Bot started via /start command")
     except Exception as e:
         logging.error(f"Error in start command: {e}")
-        await update.message.reply_text(f"Error starting bot: {e}")
-        logging.error(f"Telegram message error: {e}")
+        try:
+            await update.message.reply_text(f"Error starting bot: {e}")
+            logging.info("Telegram message sent: Error starting bot")
+        except Exception as telegram_error:
+            logging.error(f"Telegram message error: {telegram_error}")
 
 async def balance(update, context):
     try:
@@ -233,8 +243,11 @@ async def balance(update, context):
             logging.error("Telegram message sent: Error fetching balance")
     except Exception as e:
         logging.error(f"Error in balance command: {e}")
-        await update.message.reply_text(f"Error fetching balance: {e}")
-        logging.error(f"Telegram message error: {e}")
+        try:
+            await update.message.reply_text(f"Error fetching balance: {e}")
+            logging.info("Telegram message sent: Error fetching balance")
+        except Exception as telegram_error:
+            logging.error(f"Telegram message error: {telegram_error}")
 
 # Telegram handlerlari
 application.add_handler(CommandHandler('start', start))
@@ -245,9 +258,12 @@ async def main():
     try:
         if not test_api_connection():
             raise Exception("Failed to connect to Bitget API")
-        logging.info("Bot started")
-        await application.bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
-        logging.info("Telegram message sent: Bot started")
+        logging.info("Bot started successfully")
+        try:
+            await application.bot.send_message(chat_id=CHAT_ID, text="Trading bot started!")
+            logging.info("Telegram message sent: Bot started")
+        except Exception as telegram_error:
+            logging.error(f"Failed to send Telegram message on startup: {telegram_error}")
         await application.initialize()
         await application.start()
         await application.updater.start_polling(allowed_updates=["message"])
@@ -258,7 +274,11 @@ async def main():
             await asyncio.sleep(1)
     except Exception as e:
         logging.error(f"Error in main loop: {e}")
-        logging.error(f"Telegram message error: {e}")
+        try:
+            await application.bot.send_message(chat_id=CHAT_ID, text=f"Error in main loop: {e}")
+            logging.info("Telegram message sent: Error in main loop")
+        except Exception as telegram_error:
+            logging.error(f"Telegram message error: {telegram_error}")
 
 if __name__ == "__main__":
     keep_alive()  # Flask serverni ishga tushirish
